@@ -138,7 +138,7 @@ def checksum(buffer):
     return answer
 
 
-async def receive_one_ping(my_socket, id_, timeout):
+async def receive_one_ping(my_socket, id_, timeout, expected_src_ip):
     """
     receive the ping from the socket.
     :param my_socket:
@@ -151,7 +151,7 @@ async def receive_one_ping(my_socket, id_, timeout):
     try:
         async with async_timeout.timeout(timeout):
             while True:
-                rec_packet = await loop.sock_recv(my_socket, 1024)
+                rec_packet, addr = await loop.sock_recvfrom(my_socket, 1024)
 
                 # No IP Header when unpriviledged on Linux
                 has_ip_header = (
@@ -174,6 +174,9 @@ async def receive_one_ping(my_socket, id_, timeout):
                 )
 
                 if type != ICMP_ECHO_REPLY and type != ICMP6_ECHO_REPLY:
+                    continue
+
+                if addr[0] != expected_src_ip:
                     continue
 
                 if not has_ip_header:  
@@ -293,7 +296,7 @@ async def ping(dest_addr, timeout=10, family=None):
     my_id = uuid.uuid4().int & 0xFFFF
 
     await send_one_ping(my_socket, addr, my_id, timeout, family)
-    delay = await receive_one_ping(my_socket, my_id, timeout)
+    delay = await receive_one_ping(my_socket, my_id, timeout, addr[0])
     my_socket.close()
 
     return delay
