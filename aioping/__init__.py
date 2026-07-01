@@ -154,17 +154,23 @@ async def receive_one_ping(my_socket, id_, timeout, expected_src_ip):
                 finally:
                     loop.remove_reader(my_socket)
 
-                # No IP Header when unpriviledged on Linux
-                has_ip_header = (
-                    (os.name != "posix")
-                    or (platform.system() == "Darwin")
-                    or (my_socket.type == socket.SOCK_RAW)
-                )
+                # In SOCK_RAW mode, the IP header is included in the received packet.
+                # We need to determine if the packet starts with an IP header or not.
+                # On Linux SOCK_DGRAM, there is no IP header.
+                # On macOS SOCK_DGRAM, there is an IP header.
+                # On all systems SOCK_RAW, there is an IP header for IPv4.
+                # For IPv6, there is no IP header in SOCK_RAW.
 
                 time_received = default_timer()
 
-                if my_socket.family == socket.AddressFamily.AF_INET and has_ip_header:
-                    offset = 20
+                if my_socket.family == socket.AddressFamily.AF_INET:
+                    # Check the version field in the first byte. IPv4 is 4.
+                    # Also check if the packet is long enough to have an IP header.
+                    if len(rec_packet) >= 20 and (rec_packet[0] >> 4) == 4:
+                        # It's an IPv4 packet, get the IP header length.
+                        offset = (rec_packet[0] & 0x0F) * 4
+                    else:
+                        offset = 0
                 else:
                     offset = 0
 
@@ -177,15 +183,16 @@ async def receive_one_ping(my_socket, id_, timeout, expected_src_ip):
                 if type != ICMP_ECHO_REPLY and type != ICMP6_ECHO_REPLY:
                     continue
 
-                if addr[0] != expected_src_ip:
-                    continue
-
-                if not has_ip_header:
-                    # When unprivileged on Linux, ICMP ID is rewrited by kernel
-                    # to the source port of the socket.
-                    expected_id = my_socket.getsockname()[1]
-                else:
-                    expected_id = id_
+                # On Linux with SOCK_DGRAM, the kernel rewrites the ID to the source port.
+                # On other systems or with SOCK_RAW, the ID we sent is preserved.
+                # To be robust, we check if the ID matches either our random ID or the socket's port.
+                expected_id = id_
+                try:
+                    port = my_socket.getsockname()[1]
+                    if packet_id == port:
+                        expected_id = port
+                except Exception:
+                    pass
 
                 if packet_id == expected_id:
                     data = rec_packet[offset + 8:offset + 8 + struct.calcsize("!d")]
