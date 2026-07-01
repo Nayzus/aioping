@@ -106,36 +106,20 @@ proto_icmp = socket.getprotobyname("icmp")
 proto_icmp6 = socket.getprotobyname("ipv6-icmp")
 
 
-def checksum(buffer):
+def checksum(source_string):
     """
-    I'm not too confident that this is right but testing seems
-    to suggest that it gives the same answers as in_cksum in ping.c
-    :param buffer:
-    :return:
+    RFC 1071: Checksum calculation for ICMP packets.
+    :param source_string: bytes
+    :return: int
     """
-    sum = 0
-    count_to = (len(buffer) / 2) * 2
-    count = 0
+    if len(source_string) % 2:
+        source_string += b"\x00"
 
-    while count < count_to:
-        this_val = buffer[count + 1] * 256 + buffer[count]
-        sum += this_val
-        sum &= 0xffffffff # Necessary?
-        count += 2
+    res = sum(struct.unpack("!%dH" % (len(source_string) // 2), source_string))
+    res = (res >> 16) + (res & 0xffff)
+    res += res >> 16
 
-    if count_to < len(buffer):
-        sum += buffer[len(buffer) - 1]
-        sum &= 0xffffffff # Necessary?
-
-    sum = (sum >> 16) + (sum & 0xffff)
-    sum += sum >> 16
-    answer = ~sum
-    answer &= 0xffff
-
-    # Swap bytes. Bugger me if I know why.
-    answer = answer >> 8 | (answer << 8 & 0xff00)
-
-    return answer
+    return ~res & 0xffff
 
 
 async def receive_one_ping(my_socket, id_, timeout, expected_src_ip):
@@ -151,7 +135,24 @@ async def receive_one_ping(my_socket, id_, timeout, expected_src_ip):
     try:
         async with async_timeout.timeout(timeout):
             while True:
-                rec_packet, addr = await loop.sock_recvfrom(my_socket, 1024)
+                future = loop.create_future()
+
+                def _read_ready():
+                    try:
+                        data, addr = my_socket.recvfrom(1024)
+                        if not future.done():
+                            future.set_result((data, addr))
+                    except (BlockingIOError, InterruptedError):
+                        pass
+                    except Exception as exc:
+                        if not future.done():
+                            future.set_exception(exc)
+
+                loop.add_reader(my_socket, _read_ready)
+                try:
+                    rec_packet, addr = await future
+                finally:
+                    loop.remove_reader(my_socket)
 
                 # No IP Header when unpriviledged on Linux
                 has_ip_header = (
@@ -169,8 +170,8 @@ async def receive_one_ping(my_socket, id_, timeout, expected_src_ip):
 
                 icmp_header = rec_packet[offset:offset + 8]
 
-                type, code, checksum, packet_id, sequence = struct.unpack(
-                    "BBHHH", icmp_header
+                type, code, packet_checksum, packet_id, sequence = struct.unpack(
+                    "!BBHHH", icmp_header
                 )
 
                 if type != ICMP_ECHO_REPLY and type != ICMP6_ECHO_REPLY:
@@ -179,22 +180,24 @@ async def receive_one_ping(my_socket, id_, timeout, expected_src_ip):
                 if addr[0] != expected_src_ip:
                     continue
 
-                if not has_ip_header:  
+                if not has_ip_header:
                     # When unprivileged on Linux, ICMP ID is rewrited by kernel
-                    # According to https://stackoverflow.com/a/14023878/4528364
-                    id_ = int.from_bytes(my_socket.getsockname()[1].to_bytes(2, "big"), "little")
+                    # to the source port of the socket.
+                    expected_id = my_socket.getsockname()[1]
+                else:
+                    expected_id = id_
 
-                if packet_id == id_:
-                    data = rec_packet[offset + 8:offset + 8 + struct.calcsize("d")]
-                    time_sent = struct.unpack("d", data)[0]
+                if packet_id == expected_id:
+                    data = rec_packet[offset + 8:offset + 8 + struct.calcsize("!d")]
+                    time_sent = struct.unpack("!d", data)[0]
 
                     return time_received - time_sent
+                else:
+                    logger.debug("Received ICMP packet with id %s, but expected %s. Ignoring.", packet_id, id_)
+                    # We must wait for the next packet as this one was not for us
+                    continue
 
     except asyncio.TimeoutError:
-        asyncio.get_event_loop().remove_writer(my_socket)
-        asyncio.get_event_loop().remove_reader(my_socket)
-        my_socket.close()
-
         raise TimeoutError("Ping timeout")
 
 
@@ -224,21 +227,18 @@ async def send_one_ping(my_socket, dest_addr, id_, timeout, family):
         else ICMP6_ECHO_REQUEST
 
     # Header is type (8), code (8), checksum (16), id (16), sequence (16)
-    my_checksum = 0
-
     # Make a dummy header with a 0 checksum.
-    header = struct.pack("BBHHH", icmp_type, 0, my_checksum, id_, 1)
-    bytes_in_double = struct.calcsize("d")
+    header = struct.pack("!BBHHH", icmp_type, 0, 0, id_, 1)
+    bytes_in_double = struct.calcsize("!d")
     data = (192 - bytes_in_double) * "Q"
-    data = struct.pack("d", default_timer()) + data.encode("ascii")
+    data = struct.pack("!d", default_timer()) + data.encode("ascii")
 
     # Calculate the checksum on the data and the dummy header.
     my_checksum = checksum(header + data)
 
-    # Now that we have the right checksum, we put that in. It's just easier
-    # to make up a new header than to stuff it into the dummy.
+    # Now that we have the right checksum, we put that in.
     header = struct.pack(
-        "BBHHH", icmp_type, 0, socket.htons(my_checksum), id_, 1
+        "!BBHHH", icmp_type, 0, my_checksum, id_, 1
     )
     packet = header + data
 
@@ -284,22 +284,23 @@ async def ping(dest_addr, timeout=10, family=None):
         my_socket = socket.socket(family, socket.SOCK_RAW, icmp)
 
     except OSError as e:
-        if e.errno == 1:
-            # Operation not permitted, using SOCK_DGRAM instead:
+        if e.errno == 1 or e.errno == 13:
+            # Operation not permitted or Permission denied, using SOCK_DGRAM instead:
             my_socket = socket.socket(family, socket.SOCK_DGRAM, icmp)
             logger.debug("Error using socket.SOCK_RAW: '%s'. Using socket.SOCK_DGRAM instead", e.strerror)
         else:
             raise
 
-    my_socket.setblocking(False)
+    try:
+        my_socket.setblocking(False)
 
-    my_id = uuid.uuid4().int & 0xFFFF
+        my_id = uuid.uuid4().int & 0xFFFF
 
-    await send_one_ping(my_socket, addr, my_id, timeout, family)
-    delay = await receive_one_ping(my_socket, my_id, timeout, addr[0])
-    my_socket.close()
-
-    return delay
+        await send_one_ping(my_socket, addr, my_id, timeout, family)
+        delay = await receive_one_ping(my_socket, my_id, timeout, addr[0])
+        return delay
+    finally:
+        my_socket.close()
 
 
 async def verbose_ping(dest_addr, timeout=2, count=3, family=None):
